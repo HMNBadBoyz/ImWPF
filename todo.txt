@@ -1,0 +1,4 @@
+Copy all features of ImForms demo
+Some redundant code paths (ie assigning text in maker function)
+Compress code, eliminate lambdas as much as possible
+Rename project and files to better names
