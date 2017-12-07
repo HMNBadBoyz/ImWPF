@@ -3,13 +3,16 @@ using System.Threading.Tasks;
 using System.Linq;
 using CmplTime = System.Runtime.CompilerServices;
 using Wpf = System.Windows;
-using WpfUiElmt = System.Windows.UIElement;
+using WpfElement = System.Windows.UIElement;
 using WpfCtrls = System.Windows.Controls;
-using WpfUiElmtList = System.Windows.Controls.UIElementCollection;
+using WpfElementList = System.Windows.Controls.UIElementCollection;
 using WpfDocs = System.Windows.Documents;
+using WpfHandler = System.Windows.RoutedEventHandler;
 
 namespace ImWpf
 {
+
+
     public static class CompileTime
     {
         public static string ID(
@@ -22,7 +25,7 @@ namespace ImWpf
 
     public class ImFormsMgr
     {
-        public class Ctrl
+        public class ImElement
         {
             public enum State
             {
@@ -30,57 +33,106 @@ namespace ImWpf
                 Drawn
             }
 
-            public readonly WpfUiElmt WpfElmt;
-            public State CtrlState { get; set; }
+            public readonly WpfElement WpfElement;
+            public State ImState { get; set; }
             public int SortKey { get; set; }
-            public string ID { get { return WpfElmt.Uid; } }
+            public string ID { get { return WpfElement.Uid; } }
+            public WpfHandler Handler;
+            public WpfUnsubber Unsubber = (_, __) => { };
 
-            public Ctrl(WpfUiElmt control) { WpfElmt = control; }
+            public ImElement(WpfElement wpfElement, WpfHandler del)
+            {
+                WpfElement = wpfElement;
+                Handler = del;
+            }
         }
+
+        public delegate void WpfUnsubber(WpfElement element, WpfHandler handler);
+
+        public struct ElmtMakerTuple
+        {
+            public readonly WpfElement WpfElement;
+            public readonly WpfHandler Handler;
+            public readonly WpfUnsubber Unsubber;
+
+            public ElmtMakerTuple(WpfElement wpfElement, WpfHandler handler, WpfUnsubber unsubber)
+            {
+                WpfElement = wpfElement;
+                Handler = handler;
+                Unsubber = unsubber;
+            }
+
+            public static ElmtMakerTuple WithNoEvtHandling(WpfElement wpfElement)
+            {
+                return new ElmtMakerTuple(wpfElement, null, null);
+            }
+        }
+
+        public delegate ElmtMakerTuple imFormsElmtMaker(string id);
 
         private int RemainingRedraws = 0;
         private TaskCompletionSource<bool> TCS;
-        private Dictionary<string, Ctrl> ImControls;
-        public WpfUiElmtList DisplayedControls;
+        private Dictionary<string, ImElement> ImElements;
+        public WpfElementList DisplayedElements;
         private int CurrentSortKey;
         private string InteractedElementId;
 
         // OH NOTE This could be configurable by the user in the _distant_ future
         private int RedrawsPerInteraction = 1;
 
-        public ImFormsMgr(WpfUiElmtList collection)
+        public ImFormsMgr(WpfElementList collection)
         {
             InteractedElementId = null;
-            ImControls = new Dictionary<string, Ctrl>();
+            ImElements = new Dictionary<string, ImElement>();
             TCS = new TaskCompletionSource<bool>();
             CurrentSortKey = 0;
-            DisplayedControls = collection;
+            DisplayedElements = collection;
         }
 
         public void QueueRedraws(int numRedraws) { RemainingRedraws += numRedraws; }
 
-
-        public delegate WpfUiElmt ImFormsCtrlMaker(string id);
-
-        public WpfUiElmt ClickCtrlMaker<TCtrl>(string id) where TCtrl : WpfCtrls.Primitives.ButtonBase, new()
+        public ElmtMakerTuple ButtonLikeMaker<TBtn>(string id)
+            where TBtn : WpfCtrls.Primitives.ButtonBase, new()
         {
-            var wfCtrl = new TCtrl() { Uid = id };
-            wfCtrl.Click += LetImGuiHandleIt;
-            return wfCtrl;
+            var btn = new TBtn() { Uid = id };
+            var handler = new WpfHandler(LetImGuiHandleIt);
+            btn.Click += handler;
+            return new ElmtMakerTuple(btn, handler,
+                (btn1, hndl1) => ((TBtn)btn1).Click -= hndl1); // closure-free lambda
         }
 
-        public WpfCtrls.TextBlock LinkLabelMaker(string id)
+        public WpfDocs.Hyperlink TryGetHyperlink(WpfElement wpfElement)
+        {
+            var tb = (wpfElement as WpfCtrls.TextBlock);
+            if (tb != null)
+            {
+                var firstInline = tb.Inlines.FirstInline;
+                if (firstInline != null)
+                {
+                    return firstInline as WpfDocs.Hyperlink;
+                }
+            }
+            return null;
+        }
+
+        public void UnsubLinkTextBlock(WpfElement element, WpfHandler handler)
+        {
+            TryGetHyperlink(element).Click -= handler;
+        }
+
+        public ElmtMakerTuple LinkTextBlockMaker(string id)
         {
             var link = new WpfDocs.Hyperlink(new WpfDocs.Run());
             // Easiest way to do this is to capture id in a closure
             WpfCtrls.TextBlock linktxt = new WpfCtrls.TextBlock(link) { Uid = id };
-            link.Click += (o, e) =>
+            WpfHandler handler = (o, e) =>
             {
                 InteractedElementId = id;
                 QueueRedraws(RedrawsPerInteraction);
                 TCS.SetResult(true);
             };
-            return linktxt;
+            link.Click += handler;
+            return new ElmtMakerTuple(linktxt, handler, UnsubLinkTextBlock);
         }
 
         public void LetImGuiHandleIt(object sender, Wpf.RoutedEventArgs args)
@@ -90,20 +142,21 @@ namespace ImWpf
                 TCS.SetResult(true);
         }
 
-        public Ctrl ProcureControl(string id, ImFormsCtrlMaker maker)
+        public ImElement ProcureElement(string id, imFormsElmtMaker maker)
         {
-            Ctrl ctrl;
-            if (!ImControls.TryGetValue(id, out ctrl))
+            ImElement elmt;
+            if (!ImElements.TryGetValue(id, out elmt))
             {
-                ctrl = new Ctrl(maker(id));
-                ImControls.Add(id, ctrl);
+                ElmtMakerTuple t = maker(id);
+                elmt = new ImElement(t.WpfElement, t.Handler);
+                ImElements.Add(id, elmt);
             }
 
-            ctrl.CtrlState = Ctrl.State.Drawn;
-            ctrl.SortKey = CurrentSortKey;
-            ctrl.WpfElmt.Visibility = Wpf.Visibility.Visible ;
+            elmt.ImState = ImElement.State.Drawn;
+            elmt.SortKey = CurrentSortKey;
+            elmt.WpfElement.Visibility = Wpf.Visibility.Visible ;
             CurrentSortKey++;
-            return ctrl;
+            return elmt;
         }
 
         public void Space(string id)
@@ -114,33 +167,35 @@ namespace ImWpf
         public void Text(string text, string id = null)
         {
             if (id == null) id = text;
-            var ctrl = ProcureControl(id ?? text, id1 => new WpfCtrls.TextBlock() { Uid = id });
-            ((WpfCtrls.TextBlock)ctrl.WpfElmt).Text = text;
+            var elmt = ProcureElement(
+                id ?? text, 
+                id1 => ElmtMakerTuple.WithNoEvtHandling(new WpfCtrls.TextBlock() { Uid = id }));
+            ((WpfCtrls.TextBlock)elmt.WpfElement).Text = text;
         }
 
         public bool Button(string text, string id = null)
         {
-            var ctrl = ProcureControl(id ?? text, ClickCtrlMaker<WpfCtrls.Button>);
-            var Button = (WpfCtrls.Button)ctrl.WpfElmt;
+            var elmt = ProcureElement(id ?? text, ButtonLikeMaker<WpfCtrls.Button>);
+            var Button = (WpfCtrls.Button)elmt.WpfElement;
             Button.Content = text;
-            return InteractedElementId == ctrl.ID;
+            return InteractedElementId == elmt.ID;
         }
         
         public bool LinkText(string text, string id = null)
         {
-            var ctrl = ProcureControl(id ?? text, LinkLabelMaker);
-            var hyperlink = (WpfDocs.Hyperlink)((WpfCtrls.TextBlock)ctrl.WpfElmt).Inlines.FirstInline;
+            var elmt = ProcureElement(id ?? text, LinkTextBlockMaker);
+            var hyperlink = (WpfDocs.Hyperlink)((WpfCtrls.TextBlock)elmt.WpfElement).Inlines.FirstInline;
             ((WpfDocs.Run)hyperlink.Inlines.FirstInline).Text = text;
             // NOTE: this works because the Hyperlink's event handler explicitly assigns id
-            return InteractedElementId == ctrl.ID;
+            return InteractedElementId == elmt.ID;
         }
 
         public bool Checkbox(string text, ref bool checkBoxChecked, string id = null)
         {
-            var ctrl = ProcureControl(id ?? text, ClickCtrlMaker<WpfCtrls.CheckBox>);
-            var checkBox = (WpfCtrls.CheckBox)ctrl.WpfElmt;
+            var elmt = ProcureElement(id ?? text, ButtonLikeMaker<WpfCtrls.CheckBox>);
+            var checkBox = (WpfCtrls.CheckBox)elmt.WpfElement;
             checkBox.Content = text;
-            var wasInteracted = InteractedElementId == ctrl.ID;
+            var wasInteracted = InteractedElementId == elmt.ID;
 
             if (wasInteracted) { checkBoxChecked = checkBox.IsChecked.GetValueOrDefault(); }
             else { checkBox.IsChecked = checkBoxChecked; }
@@ -150,10 +205,10 @@ namespace ImWpf
 
         public bool RadioButton(string text, ref int value, int checkAgainst, string id = null)
         {
-            var ctrl = ProcureControl(id ?? text, ClickCtrlMaker<WpfCtrls.RadioButton>);
-            var radioButton = (WpfCtrls.RadioButton)ctrl.WpfElmt;
+            var elmt = ProcureElement(id ?? text, ButtonLikeMaker<WpfCtrls.RadioButton>);
+            var radioButton = (WpfCtrls.RadioButton)elmt.WpfElement;
             radioButton.Content = text;
-            var wasInteracted = InteractedElementId == ctrl.ID;
+            var wasInteracted = InteractedElementId == elmt.ID;
 
             if (wasInteracted) { value = checkAgainst; }
             else { radioButton.IsChecked = (value == checkAgainst); }
@@ -169,35 +224,36 @@ namespace ImWpf
         public async Task NextFrame()
         {
             // PrevInteractedElement = InteractedElement;
-            const int ctrlsToTriggerCleanup = 100;
-            const int ctrlsToRemoveForCleanup = 50;
+            const int elmtsToTriggerCleanup = 100;
+            const int elmtsToCleanup = 50;
 
-            var undrawnControls = ImControls.Values.Where(ctrl => ctrl.CtrlState == Ctrl.State.NotDrawn)
-                .Take(ctrlsToTriggerCleanup).ToList();
+            var undrawnElements = ImElements.Values.Where(elmt => elmt.ImState == ImElement.State.NotDrawn)
+                .Take(elmtsToTriggerCleanup).ToList();
 
-            if (undrawnControls.Count == ctrlsToTriggerCleanup)
+            if (undrawnElements.Count == elmtsToTriggerCleanup)
             {
-                foreach (var ctrl in undrawnControls.Take(ctrlsToRemoveForCleanup))
+                foreach (var elmt in undrawnElements.Take(elmtsToCleanup))
                 {
-                    ImControls.Remove(ctrl.ID);
+                    elmt.Unsubber(elmt.WpfElement, elmt.Handler);
+                    ImElements.Remove(elmt.ID);
                 }
             }
 
             InteractedElementId = null;
-            WpfUiElmt[] sortedControls = ImControls.Values.Where(x => x.CtrlState == Ctrl.State.Drawn)
-                .OrderBy(c => c.SortKey).Select(c => c.WpfElmt).ToArray();
-            var controlsChanged = DisplayedControls.Count != sortedControls.Length
+            WpfElement[] sortedWpfElements = ImElements.Values.Where(x => x.ImState == ImElement.State.Drawn)
+                .OrderBy(c => c.SortKey).Select(c => c.WpfElement).ToArray();
+            var wpfElementsChanged = DisplayedElements.Count != sortedWpfElements.Length
                 || !Enumerable.Zip(
-                        DisplayedControls.OfType<WpfCtrls.Control>(),
-                        sortedControls,
+                        DisplayedElements.OfType<WpfElement>(),
+                        sortedWpfElements,
                         (c1, c2) => c1 == c2).All(b => b);
 
-            if (controlsChanged)
+            if (wpfElementsChanged)
             {
-                DisplayedControls.Clear();
-                foreach (var item in sortedControls)
+                DisplayedElements.Clear();
+                foreach (var item in sortedWpfElements)
                 {
-                    DisplayedControls.Add(item);
+                    DisplayedElements.Add(item);
                 }
             }
 
@@ -213,10 +269,10 @@ namespace ImWpf
                 RemainingRedraws--;
             }
 
-            foreach (var ctrl in ImControls.Values)
+            foreach (var elmt in ImElements.Values)
             {
-                ctrl.CtrlState = Ctrl.State.NotDrawn;
-                ctrl.SortKey = 999999;
+                elmt.ImState = ImElement.State.NotDrawn;
+                elmt.SortKey = 999999;
             }
         }
     }
